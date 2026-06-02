@@ -20,7 +20,18 @@ const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS || 2000);
 const SHOW_REASONING = process.env.SHOW_REASONING === "true";
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === "true";
 
-app.use(cors());
+// Safer for JanitorAI + Railway. Streaming often causes cursed browser fetch errors.
+const FORCE_NON_STREAM = process.env.FORCE_NON_STREAM !== "false";
+
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
@@ -35,51 +46,6 @@ const MODEL_MAPPING = {
   "qwen": "qwen/qwen3-coder-480b-a35b-instruct"
 };
 
-function clampTokens(value) {
-  const n = Number(value || DEFAULT_MAX_TOKENS);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_TOKENS;
-  return Math.min(n, HARD_MAX_TOKENS);
-}
-
-function trimText(text) {
-  if (typeof text !== "string") return text;
-  if (text.length <= MAX_CONTENT_CHARS) return text;
-  return text.slice(-MAX_CONTENT_CHARS);
-}
-
-function trimContent(content) {
-  if (typeof content === "string") return trimText(content);
-
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (part && typeof part === "object" && typeof part.text === "string") {
-        return { ...part, text: trimText(part.text) };
-      }
-      return part;
-    });
-  }
-
-  return content;
-}
-
-function trimMessages(messages) {
-  if (!Array.isArray(messages)) {
-    return [{ role: "user", content: String(messages || "") }];
-  }
-
-  const systemMessages = messages
-    .filter((m) => m.role === "system")
-    .slice(0, 1);
-
-  const normalMessages = messages.filter((m) => m.role !== "system");
-  const recentMessages = normalMessages.slice(-MAX_MESSAGES);
-
-  return [...systemMessages, ...recentMessages].map((m) => ({
-    role: m.role || "user",
-    content: trimContent(m.content || "")
-  }));
-}
-
 function resolveModel(model) {
   if (!model) return MODEL_MAPPING.qwen;
 
@@ -87,8 +53,140 @@ function resolveModel(model) {
     return MODEL_MAPPING[model];
   }
 
-  // If you pass exact NIM model name directly, let it through.
+  // Allows exact NIM model IDs if you manually pass one.
   return model;
+}
+
+function clampTokens(value) {
+  const n = Number(value || DEFAULT_MAX_TOKENS);
+
+  if (!Number.isFinite(n) || n <= 0) {
+    return DEFAULT_MAX_TOKENS;
+  }
+
+  return Math.min(Math.floor(n), HARD_MAX_TOKENS);
+}
+
+function clampTemperature(value) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return 0.8;
+  }
+
+  return Math.min(Math.max(n, 0), 2);
+}
+
+function clampTopP(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return undefined;
+  }
+
+  return Math.min(Math.max(n, 0.01), 1);
+}
+
+function trimText(text) {
+  if (typeof text !== "string") {
+    return "";
+  }
+
+  if (text.length <= MAX_CONTENT_CHARS) {
+    return text;
+  }
+
+  return text.slice(-MAX_CONTENT_CHARS);
+}
+
+function contentToText(content) {
+  if (typeof content === "string") {
+    return trimText(content);
+  }
+
+  if (Array.isArray(content)) {
+    return trimText(
+      content
+        .map((part) => {
+          if (typeof part === "string") return part;
+
+          if (part && typeof part === "object") {
+            if (typeof part.text === "string") return part.text;
+            if (typeof part.content === "string") return part.content;
+          }
+
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n")
+    );
+  }
+
+  if (content === null || content === undefined) {
+    return "";
+  }
+
+  return trimText(String(content));
+}
+
+function normalizeRole(role) {
+  if (role === "system") return "system";
+  if (role === "assistant") return "assistant";
+  if (role === "user") return "user";
+
+  // Some providers send weird roles. NIM may 400 on those.
+  if (role === "developer") return "system";
+  if (role === "tool" || role === "function") return "user";
+
+  return "user";
+}
+
+function trimMessages(messages) {
+  if (!Array.isArray(messages)) {
+    return [{ role: "user", content: contentToText(messages) || "Hello" }];
+  }
+
+  const cleaned = messages
+    .map((m) => ({
+      role: normalizeRole(m?.role),
+      content: contentToText(m?.content)
+    }))
+    .filter((m) => m.content && m.content.trim().length > 0);
+
+  const systemMessages = cleaned
+    .filter((m) => m.role === "system")
+    .slice(0, 1);
+
+  const normalMessages = cleaned.filter((m) => m.role !== "system");
+  const recentMessages = normalMessages.slice(-MAX_MESSAGES);
+
+  const finalMessages = [...systemMessages, ...recentMessages];
+
+  if (finalMessages.length === 0) {
+    return [{ role: "user", content: "Hello" }];
+  }
+
+  return finalMessages;
+}
+
+function extractUpstreamMessage(data, fallback) {
+  if (!data) return fallback || "Unknown upstream error";
+
+  if (typeof data === "string") return data;
+
+  if (data.error) {
+    if (typeof data.error === "string") return data.error;
+    if (typeof data.error.message === "string") return data.error.message;
+    return JSON.stringify(data.error);
+  }
+
+  if (typeof data.message === "string") return data.message;
+
+  return JSON.stringify(data);
 }
 
 app.get("/", (req, res) => {
@@ -107,8 +205,11 @@ app.get("/health", (req, res) => {
     body_limit: BODY_LIMIT,
     max_messages: MAX_MESSAGES,
     max_content_chars: MAX_CONTENT_CHARS,
+    default_max_tokens: DEFAULT_MAX_TOKENS,
+    hard_max_tokens: HARD_MAX_TOKENS,
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    force_non_stream: FORCE_NON_STREAM
   });
 });
 
@@ -146,28 +247,28 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
-    const {
-      model = "qwen",
-      messages = [],
-      temperature = 0.8,
-      top_p,
-      max_tokens,
-      stream = false
-    } = req.body || {};
+    const body = req.body || {};
 
+    const model = body.model || "qwen";
     const nimModel = resolveModel(model);
-    const safeMessages = trimMessages(messages);
+
+    const safeMessages = trimMessages(body.messages || []);
+    const safeTemperature = clampTemperature(body.temperature);
+    const safeTopP = clampTopP(body.top_p);
+    const safeMaxTokens = clampTokens(body.max_tokens);
+
+    const shouldStream = FORCE_NON_STREAM ? false : Boolean(body.stream);
 
     const nimRequest = {
       model: nimModel,
       messages: safeMessages,
-      temperature,
-      max_tokens: clampTokens(max_tokens),
-      stream: Boolean(stream)
+      temperature: safeTemperature,
+      max_tokens: safeMaxTokens,
+      stream: shouldStream
     };
 
-    if (top_p !== undefined) {
-      nimRequest.top_p = top_p;
+    if (safeTopP !== undefined) {
+      nimRequest.top_p = safeTopP;
     }
 
     if (ENABLE_THINKING_MODE) {
@@ -178,6 +279,23 @@ app.post("/v1/chat/completions", async (req, res) => {
       };
     }
 
+    console.log("===== OUTGOING NIM REQUEST =====");
+    console.log(
+      JSON.stringify(
+        {
+          model_alias: model,
+          nim_model: nimModel,
+          message_count: safeMessages.length,
+          max_tokens: safeMaxTokens,
+          temperature: safeTemperature,
+          top_p: safeTopP,
+          stream: shouldStream
+        },
+        null,
+        2
+      )
+    );
+
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
       nimRequest,
@@ -186,14 +304,34 @@ app.post("/v1/chat/completions", async (req, res) => {
           Authorization: `Bearer ${NIM_API_KEY}`,
           "Content-Type": "application/json"
         },
-        responseType: stream ? "stream" : "json",
+        responseType: shouldStream ? "stream" : "json",
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
-        timeout: 120000
+        timeout: 120000,
+        validateStatus: () => true
       }
     );
 
-    if (stream) {
+    if (response.status < 200 || response.status >= 300) {
+      console.error("===== NIM UPSTREAM ERROR =====");
+      console.error("Status:", response.status);
+      console.error("Data:", JSON.stringify(response.data, null, 2));
+
+      const upstreamMessage = extractUpstreamMessage(
+        response.data,
+        `NVIDIA NIM returned HTTP ${response.status}`
+      );
+
+      return res.status(response.status).json({
+        error: {
+          message: upstreamMessage,
+          type: response.data?.error?.type || "invalid_request_error",
+          code: response.data?.error?.code || response.status
+        }
+      });
+    }
+
+    if (shouldStream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
@@ -215,11 +353,11 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     const openaiResponse = {
-      id: `chatcmpl-${Date.now()}`,
+      id: response.data?.id || `chatcmpl-${Date.now()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model,
-      choices: (response.data.choices || []).map((choice, index) => {
+      choices: (response.data?.choices || []).map((choice, index) => {
         let content = choice.message?.content || "";
 
         if (SHOW_REASONING && choice.message?.reasoning_content) {
@@ -239,29 +377,43 @@ app.post("/v1/chat/completions", async (req, res) => {
           finish_reason: choice.finish_reason || "stop"
         };
       }),
-      usage: response.data.usage || {
+      usage: response.data?.usage || {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0
       }
     };
 
+    // Fallback if upstream returns weird empty choices
+    if (!openaiResponse.choices.length) {
+      openaiResponse.choices = [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: ""
+          },
+          finish_reason: "stop"
+        }
+      ];
+    }
+
     res.json(openaiResponse);
   } catch (error) {
-    console.error("Proxy error:", error.response?.data || error.message);
+    console.error("===== PROXY INTERNAL ERROR =====");
+    console.error("Message:", error.message);
+    console.error("Stack:", error.stack);
 
     const status = error.response?.status || 500;
-    const message =
-      error.response?.data?.error?.message ||
-      error.response?.data?.message ||
-      error.message ||
-      "Unknown proxy error";
+    const upstreamData = error.response?.data;
+
+    const message = extractUpstreamMessage(upstreamData, error.message);
 
     res.status(status).json({
       error: {
-        message: `PROXY ERROR ${status}: ${message}`,
-        type: "invalid_request_error",
-        code: status
+        message,
+        type: upstreamData?.error?.type || "proxy_error",
+        code: upstreamData?.error?.code || status
       }
     });
   }
@@ -272,7 +424,7 @@ app.use((err, req, res, next) => {
     return res.status(413).json({
       error: {
         message:
-          "PROXY ERROR 413: Payload too large. Lower JanitorAI context or reduce MAX_MESSAGES/MAX_CONTENT_CHARS.",
+          "Payload too large. Lower JanitorAI context or reduce MAX_MESSAGES/MAX_CONTENT_CHARS on Railway.",
         type: "invalid_request_error",
         code: 413
       }
