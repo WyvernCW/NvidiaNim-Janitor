@@ -7,22 +7,22 @@ const axios = require("axios");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-
-const CLOUDFLARE_API_TOKEN =
-  process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN;
-
-const CLOUDFLARE_ACCOUNT_ID =
-  process.env.CLOUDFLARE_ACCOUNT_ID || process.env.CF_ACCOUNT_ID;
+const NIM_API_KEY = process.env.NIM_API_KEY || process.env.NVIDIA_API_KEY;
+const NIM_API_BASE =
+  process.env.NIM_API_BASE || "https://integrate.api.nvidia.com/v1";
 
 const BODY_LIMIT = process.env.BODY_LIMIT || "50mb";
 const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 25);
 const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 8000);
-const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS || 800);
-const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS || 1600);
+const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS || 1200);
+const HARD_MAX_TOKENS = Number(process.env.HARD_MAX_TOKENS || 2000);
 
-const STRIP_THINK_TAGS = process.env.STRIP_THINK_TAGS !== "false";
+const SHOW_REASONING = process.env.SHOW_REASONING === "true";
+const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === "true";
 
-// CORS fix for JanitorAI browser requests
+// Safer for JanitorAI + Railway. Streaming often causes cursed browser fetch errors.
+const FORCE_NON_STREAM = process.env.FORCE_NON_STREAM !== "false";
+
 const corsOptions = {
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -35,16 +35,26 @@ app.options("*", cors(corsOptions));
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
-// Model mapping, JanitorAI aliases -> Cloudflare model IDs
+// Model mapping, kept intact
 const MODEL_MAPPING = {
-  "gemma": "@cf/google/gemma-4-26b-a4b-it",
-  "deepseek": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-  "nvidia": "@cf/nvidia/nemotron-3-120b-a12b"
+  "minimax": "minimaxai/minimax-m2.7",
+  "cosmos-1": "nvidia/cosmos3-nano-reasoner",
+  "kimi": "moonshotai/kimi-k2-instruct-0905",
+  "deepseek": "deepseek-ai/deepseek-v3.1",
+  "stepfun-ai": "stepfun-ai/step-3.7-flash",
+  "glm": "z-ai/glm-5.1",
+  "qwen": "qwen/qwen3-coder-480b-a35b-instruct"
 };
 
 function resolveModel(model) {
-  if (!model) return MODEL_MAPPING.deepseek;
-  return MODEL_MAPPING[model] || model;
+  if (!model) return MODEL_MAPPING.qwen;
+
+  if (MODEL_MAPPING[model]) {
+    return MODEL_MAPPING[model];
+  }
+
+  // Allows exact NIM model IDs if you manually pass one.
+  return model;
 }
 
 function clampTokens(value) {
@@ -128,6 +138,7 @@ function normalizeRole(role) {
   if (role === "assistant") return "assistant";
   if (role === "user") return "user";
 
+  // Some providers send weird roles. NIM may 400 on those.
   if (role === "developer") return "system";
   if (role === "tool" || role === "function") return "user";
 
@@ -136,12 +147,7 @@ function normalizeRole(role) {
 
 function trimMessages(messages) {
   if (!Array.isArray(messages)) {
-    return [
-      {
-        role: "user",
-        content: contentToText(messages) || "Hello"
-      }
-    ];
+    return [{ role: "user", content: contentToText(messages) || "Hello" }];
   }
 
   const cleaned = messages
@@ -161,31 +167,16 @@ function trimMessages(messages) {
   const finalMessages = [...systemMessages, ...recentMessages];
 
   if (finalMessages.length === 0) {
-    return [
-      {
-        role: "user",
-        content: "Hello"
-      }
-    ];
+    return [{ role: "user", content: "Hello" }];
   }
 
   return finalMessages;
 }
 
-function stripThinkTags(content) {
-  if (!STRIP_THINK_TAGS || typeof content !== "string") {
-    return content;
-  }
+function extractUpstreamMessage(data, fallback) {
+  if (!data) return fallback || "Unknown upstream error";
 
-  return content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-}
-
-function extractError(data, fallback) {
-  if (!data) return fallback || "Unknown error";
-
-  if (typeof data === "string") {
-    return data;
-  }
+  if (typeof data === "string") return data;
 
   if (data.error) {
     if (typeof data.error === "string") return data.error;
@@ -193,27 +184,15 @@ function extractError(data, fallback) {
     return JSON.stringify(data.error);
   }
 
-  if (Array.isArray(data.errors) && data.errors.length > 0) {
-    return data.errors
-      .map((err) => err.message || JSON.stringify(err))
-      .join(" | ");
-  }
-
-  if (typeof data.message === "string") {
-    return data.message;
-  }
+  if (typeof data.message === "string") return data.message;
 
   return JSON.stringify(data);
-}
-
-function getCloudflareChatUrl() {
-  return `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`;
 }
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    service: "JanitorAI to Cloudflare Workers AI Proxy",
+    service: "OpenAI to NVIDIA NIM Proxy",
     routes: ["/health", "/v1", "/v1/models", "/v1/chat/completions"]
   });
 });
@@ -221,15 +200,16 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    service: "JanitorAI to Cloudflare Workers AI Proxy",
-    account_id_set: Boolean(CLOUDFLARE_ACCOUNT_ID),
-    token_set: Boolean(CLOUDFLARE_API_TOKEN),
+    service: "OpenAI to NVIDIA NIM Proxy",
+    nim_base: NIM_API_BASE,
     body_limit: BODY_LIMIT,
     max_messages: MAX_MESSAGES,
     max_content_chars: MAX_CONTENT_CHARS,
     default_max_tokens: DEFAULT_MAX_TOKENS,
     hard_max_tokens: HARD_MAX_TOKENS,
-    strip_think_tags: STRIP_THINK_TAGS
+    reasoning_display: SHOW_REASONING,
+    thinking_mode: ENABLE_THINKING_MODE,
+    force_non_stream: FORCE_NON_STREAM
   });
 });
 
@@ -246,7 +226,7 @@ app.get("/v1/models", (req, res) => {
     id: model,
     object: "model",
     created: Math.floor(Date.now() / 1000),
-    owned_by: "cloudflare-workers-ai-proxy"
+    owned_by: "nvidia-nim-proxy"
   }));
 
   res.json({
@@ -257,20 +237,10 @@ app.get("/v1/models", (req, res) => {
 
 app.post("/v1/chat/completions", async (req, res) => {
   try {
-    if (!CLOUDFLARE_API_TOKEN) {
+    if (!NIM_API_KEY) {
       return res.status(500).json({
         error: {
-          message: "Missing CLOUDFLARE_API_TOKEN or CF_API_TOKEN on Railway",
-          type: "server_error",
-          code: 500
-        }
-      });
-    }
-
-    if (!CLOUDFLARE_ACCOUNT_ID) {
-      return res.status(500).json({
-        error: {
-          message: "Missing CLOUDFLARE_ACCOUNT_ID or CF_ACCOUNT_ID on Railway",
+          message: "Missing NIM_API_KEY or NVIDIA_API_KEY on Railway",
           type: "server_error",
           code: 500
         }
@@ -279,36 +249,47 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     const body = req.body || {};
 
-    const model = body.model || "deepseek";
-    const cloudflareModel = resolveModel(model);
+    const model = body.model || "qwen";
+    const nimModel = resolveModel(model);
 
     const safeMessages = trimMessages(body.messages || []);
     const safeTemperature = clampTemperature(body.temperature);
     const safeTopP = clampTopP(body.top_p);
     const safeMaxTokens = clampTokens(body.max_tokens);
 
-    const cloudflareRequest = {
-      model: cloudflareModel,
+    const shouldStream = FORCE_NON_STREAM ? false : Boolean(body.stream);
+
+    const nimRequest = {
+      model: nimModel,
       messages: safeMessages,
       temperature: safeTemperature,
       max_tokens: safeMaxTokens,
-      stream: false
+      stream: shouldStream
     };
 
     if (safeTopP !== undefined) {
-      cloudflareRequest.top_p = safeTopP;
+      nimRequest.top_p = safeTopP;
     }
 
-    console.log("===== OUTGOING CLOUDFLARE REQUEST =====");
+    if (ENABLE_THINKING_MODE) {
+      nimRequest.extra_body = {
+        chat_template_kwargs: {
+          thinking: true
+        }
+      };
+    }
+
+    console.log("===== OUTGOING NIM REQUEST =====");
     console.log(
       JSON.stringify(
         {
           model_alias: model,
-          cloudflare_model: cloudflareModel,
+          nim_model: nimModel,
           message_count: safeMessages.length,
           max_tokens: safeMaxTokens,
           temperature: safeTemperature,
-          top_p: safeTopP
+          top_p: safeTopP,
+          stream: shouldStream
         },
         null,
         2
@@ -316,52 +297,82 @@ app.post("/v1/chat/completions", async (req, res) => {
     );
 
     const response = await axios.post(
-      getCloudflareChatUrl(),
-      cloudflareRequest,
+      `${NIM_API_BASE}/chat/completions`,
+      nimRequest,
       {
         headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          Authorization: `Bearer ${NIM_API_KEY}`,
           "Content-Type": "application/json"
         },
-        validateStatus: () => true,
-        timeout: 120000,
+        responseType: shouldStream ? "stream" : "json",
         maxBodyLength: Infinity,
-        maxContentLength: Infinity
+        maxContentLength: Infinity,
+        timeout: 120000,
+        validateStatus: () => true
       }
     );
 
     if (response.status < 200 || response.status >= 300) {
-      console.error("===== CLOUDFLARE ERROR =====");
+      console.error("===== NIM UPSTREAM ERROR =====");
       console.error("Status:", response.status);
       console.error("Data:", JSON.stringify(response.data, null, 2));
 
+      const upstreamMessage = extractUpstreamMessage(
+        response.data,
+        `NVIDIA NIM returned HTTP ${response.status}`
+      );
+
       return res.status(response.status).json({
         error: {
-          message: extractError(
-            response.data,
-            `Cloudflare returned HTTP ${response.status}`
-          ),
+          message: upstreamMessage,
           type: response.data?.error?.type || "invalid_request_error",
           code: response.data?.error?.code || response.status
         }
       });
     }
 
-    const choices = response.data?.choices || [];
+    if (shouldStream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      response.data.on("data", (chunk) => {
+        res.write(chunk);
+      });
+
+      response.data.on("end", () => {
+        res.end();
+      });
+
+      response.data.on("error", (err) => {
+        console.error("Stream error:", err.message);
+        res.end();
+      });
+
+      return;
+    }
 
     const openaiResponse = {
       id: response.data?.id || `chatcmpl-${Date.now()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model,
-      choices: choices.map((choice, index) => {
-        const rawContent = choice.message?.content || "";
+      choices: (response.data?.choices || []).map((choice, index) => {
+        let content = choice.message?.content || "";
+
+        if (SHOW_REASONING && choice.message?.reasoning_content) {
+          content =
+            "<think>\n" +
+            choice.message.reasoning_content +
+            "\n</think>\n\n" +
+            content;
+        }
 
         return {
           index: choice.index ?? index,
           message: {
             role: choice.message?.role || "assistant",
-            content: stripThinkTags(rawContent)
+            content
           },
           finish_reason: choice.finish_reason || "stop"
         };
@@ -373,6 +384,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     };
 
+    // Fallback if upstream returns weird empty choices
     if (!openaiResponse.choices.length) {
       openaiResponse.choices = [
         {
@@ -392,11 +404,16 @@ app.post("/v1/chat/completions", async (req, res) => {
     console.error("Message:", error.message);
     console.error("Stack:", error.stack);
 
-    res.status(500).json({
+    const status = error.response?.status || 500;
+    const upstreamData = error.response?.data;
+
+    const message = extractUpstreamMessage(upstreamData, error.message);
+
+    res.status(status).json({
       error: {
-        message: error.message || "Internal proxy error",
-        type: "proxy_error",
-        code: 500
+        message,
+        type: upstreamData?.error?.type || "proxy_error",
+        code: upstreamData?.error?.code || status
       }
     });
   }
@@ -407,7 +424,7 @@ app.use((err, req, res, next) => {
     return res.status(413).json({
       error: {
         message:
-          "Payload too large. Lower JanitorAI context or reduce MAX_MESSAGES/MAX_CONTENT_CHARS.",
+          "Payload too large. Lower JanitorAI context or reduce MAX_MESSAGES/MAX_CONTENT_CHARS on Railway.",
         type: "invalid_request_error",
         code: 413
       }
@@ -436,7 +453,7 @@ app.all("*", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Cloudflare Workers AI proxy running on port ${PORT}`);
+  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health: /health`);
   console.log(`Models: /v1/models`);
   console.log(`Chat: /v1/chat/completions`);
