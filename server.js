@@ -1,19 +1,3 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// NVIDIA NIM API configuration
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
-
 require("dotenv").config();
 
 const express = require("express");
