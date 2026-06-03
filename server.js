@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models') {
+  if (req.path === '/' || req.path === '/health' || req.path === '/v1/models') {
     return next();
   }
 
@@ -217,6 +217,10 @@ if (!SKIP_VALIDATION) {
     console.error('[VALIDATION] Check failed:', err.message);
   });
 }
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'Hybrid OpenAI ↔ NIM Proxy is running' });
+});
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
