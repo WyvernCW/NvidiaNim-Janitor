@@ -39,8 +39,8 @@ app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 const MODEL_MAPPING = {
   "minimax": "minimaxai/minimax-m2.7",
   "cosmos-1": "nvidia/cosmos3-nano-reasoner",
-  "kimi": "moonshotai/kimi-k2-instruct-0905",
-  "deepseek": "deepseek-ai/deepseek-v3.1",
+  "kimi": "moonshotai/kimi-k2.6",
+  "deepseek": "deepseek-ai/deepseek-v4-flash",
   "stepfun-ai": "stepfun-ai/step-3.7-flash",
   "glm": "z-ai/glm-5.1",
   "qwen": "qwen/qwen3-coder-480b-a35b-instruct"
